@@ -1,0 +1,178 @@
+<!doctype html>
+<html lang="ja">
+<head>
+  <meta charset="utf-8">
+  <title>テスト(Step 4: 空き・Gap・自動提案)</title>
+  <style>
+    body { font: 14px/1.6 "Yu Gothic UI", "Meiryo", sans-serif; margin: 20px; }
+    .ok { color: #1b7f3b; }
+    .ng { color: #c62828; font-weight: bold; }
+    #summary { font-size: 16px; font-weight: bold; margin-bottom: 8px; }
+    pre { margin: 0 0 0 1.5em; }
+  </style>
+</head>
+<body>
+  <h1>空き・Gap・組み直し・自動提案のテスト</h1>
+  <p>ブラウザで開くだけで実行されます(Live Server 経由で開いてください)。集計ロジックのテストは <a href="tests.html">tests.html</a> です。</p>
+  <div id="summary"></div>
+  <div id="out"></div>
+  <script type="module">
+    import { buildCapMap, freeByMemberMonth, gapByMonth, loadByMemberDay, teamFreeByCell } from './js/calc.js';
+    import { isWeekend } from './js/dates.js';
+    import { rebuildRules } from './js/expand.js';
+    import { solve } from './js/solver.js';
+
+    const results = [];
+    const eq = (actual, expected) => {
+      const a = JSON.stringify(actual), e = JSON.stringify(expected);
+      if (a !== e) throw new Error(`期待 ${e} / 実際 ${a}`);
+    };
+    const test = (name, fn) => {
+      try { fn(); results.push({ name }); } catch (err) { results.push({ name, err: err.message }); }
+    };
+
+    const m1 = { member_id: 'M1', name: 'A', std_cap: 8 };
+    const m2 = { member_id: 'M2', name: 'B', std_cap: 8 };
+    const d2 = (n) => `2026-11-${String(n).padStart(2, '0')}`;
+    // 2026-11 の平日(21日): 2,3,4,5,6, 9-13, 16-20, 23-27, 30
+    const WORKDAYS = [2, 3, 4, 5, 6, 9, 10, 11, 12, 13, 16, 17, 18, 19, 20, 23, 24, 25, 26, 27, 30];
+    const fill = (member, client, hours, skip = []) =>
+      WORKDAYS.filter((d) => !skip.includes(d)).map((d) => ({ member_id: member, client_id: client, date: d2(d), hours }));
+
+    // ---- 空き・Gap ----
+    test('月の空き: 平日の Cap − L を合計(2026-11 は平日21日)', () => {
+      eq(freeByMemberMonth([m1], new Map(), new Map(), ['2026-11']).get('M1|2026-11'), 21 * 8);
+    });
+    test('月の空き: 配員と祝日(Cap 0)を引く', () => {
+      const loads = loadByMemberDay([{ member_id: 'M1', client_id: 'C1', date: d2(2), hours: 3 }]);
+      const cm = buildCapMap([{ member_id: 'M1', date: d2(3), cap: 0 }]);
+      eq(freeByMemberMonth([m1], loads, cm, ['2026-11']).get('M1|2026-11'), 21 * 8 - 3 - 8);
+    });
+    test('月の空き: 超過している日は空き0(他の日の空きと相殺しない)', () => {
+      const loads = loadByMemberDay([{ member_id: 'M1', client_id: 'C1', date: d2(2), hours: 10 }]);
+      eq(freeByMemberMonth([m1], loads, new Map(), ['2026-11']).get('M1|2026-11'), 20 * 8);
+    });
+    test('チーム内の空き: チームのメンバーの空きだけを合計', () => {
+      const f = new Map([['M1|2026-11', 10], ['M2|2026-11', 5]]);
+      const t = teamFreeByCell([{ client_id: 'C1', member_id: 'M1' }, { client_id: 'C2', member_id: 'M2' }], f, ['C1', 'C2', 'C3'], ['2026-11']);
+      eq([t.get('C1|2026-11'), t.get('C2|2026-11'), t.get('C3|2026-11')], [10, 5, 0]);
+    });
+    test('Gap: 不足の合計 − 空きの合計(正負とも)', () => {
+      const s = new Map([['C1|2026-11', { month: '2026-11', short: 30 }], ['C2|2026-11', { month: '2026-11', short: 5 }], ['C1|2026-12', { month: '2026-12', short: 2 }]]);
+      const f = new Map([['M1|2026-11', 10], ['M2|2026-11', 5], ['M1|2026-12', 40]]);
+      const g = gapByMonth(s, f, ['2026-11', '2026-12']);
+      eq(g.get('2026-11'), { short: 35, free: 15, gap: 20 });
+      eq(g.get('2026-12'), { short: 2, free: 40, gap: -38 });
+    });
+
+    // ---- ルールの組み直し ----
+    test('組み直し: 金→月をまたぐ平日は1つのルール、時間が変わる所で分割', () => {
+      const src = [['2026-10-29', 4], ['2026-10-30', 4], ['2026-11-02', 4], ['2026-11-03', 2], ['2026-11-04', 2]]
+        .map(([date, hours]) => ({ member_id: 'M1', client_id: 'C1', date, hours }));
+      const { rules, allocations } = rebuildRules(src, 'x');
+      eq(rules.map((r) => [r.start, r.end, r.hours_per_day, r.include_weekend]), [['2026-10-29', '2026-11-02', 4, false], ['2026-11-03', '2026-11-04', 2, false]]);
+      eq(allocations.map((a) => `${a.date}|${a.hours}`).sort(), src.map((a) => `${a.date}|${a.hours}`).sort());
+    });
+    test('組み直し: 飛び飛びの日は別ルール、メンバーごとにも分ける', () => {
+      const src = [
+        { member_id: 'M1', client_id: 'C1', date: d2(2), hours: 4 }, { member_id: 'M1', client_id: 'C1', date: d2(4), hours: 4 },
+        { member_id: 'M2', client_id: 'C1', date: d2(2), hours: 4 },
+      ];
+      eq(rebuildRules(src, 'x').rules.length, 3);
+    });
+    test('組み直し: 土日の配員は土日を含むルールになり、平日と混ざらない', () => {
+      const src = [{ member_id: 'M1', client_id: 'C1', date: '2026-10-30', hours: 2 }, { member_id: 'M1', client_id: 'C1', date: '2026-10-31', hours: 2 }];
+      const { rules, allocations } = rebuildRules(src, 'x');
+      eq(rules.map((r) => r.include_weekend).sort(), [false, true]);
+      eq(allocations.length, 2);
+    });
+
+    // ---- 自動提案 ----
+    const base = (over = {}) => ({
+      mode: 'A', weights: { w1: 3, w2: 2, w3: 1 }, allowOutsiders: false, fromDate: '2026-11-01', months: ['2026-11'],
+      members: [m1, m2], capacity: [], teams: [{ client_id: 'C1', member_id: 'M1' }],
+      demand: [{ client_id: 'C1', month: '2026-11', hours: 40 }], lockedAllocs: [], allocs: [], ...over,
+    });
+    const total = (xs) => xs.reduce((s, a) => s + a.hours, 0);
+
+    test('提案A: チームメンバーの空きで不足を埋める(上限・必要工数を超えない)', () => {
+      const r = solve(base());
+      eq(r.stats.totalAfter, 0);
+      eq(total(r.allocations), 40);
+      eq(r.allocations.every((a) => a.member_id === 'M1' && a.client_id === 'C1'), true);
+      for (const v of loadByMemberDay(r.allocations).values()) eq(v <= 8, true);
+    });
+    test('提案A: 土日・上限0の日には配員しない。入らない分は「解消できなかった不足」', () => {
+      const r = solve(base({ capacity: [{ member_id: 'M1', date: d2(2), cap: 0 }], demand: [{ client_id: 'C1', month: '2026-11', hours: 168 }] }));
+      eq(r.allocations.some((a) => a.date === d2(2) || isWeekend(a.date)), false);
+      eq(r.unresolved.map((u) => u.short), [8]); // 20日×8h=160 まで。残り8hは埋まらない
+    });
+    test('提案A: 既存配員は減らさず、開始日より前の日は動かさない', () => {
+      const allocs = [{ member_id: 'M1', client_id: 'C1', date: d2(2), hours: 8 }];
+      const r = solve(base({ allocs, fromDate: d2(5), demand: [{ client_id: 'C1', month: '2026-11', hours: 20 }] }));
+      eq(r.allocations.find((a) => a.date === d2(2)).hours, 8);
+      eq(r.allocations.filter((a) => a.date < d2(5)).length, 1);
+      eq(r.stats.totalAfter, 0);
+    });
+    test('提案A: ロックした配員は負荷に数えるが、動かさない', () => {
+      const locked = [{ member_id: 'M1', client_id: 'C2', date: d2(2), hours: 8 }];
+      const r = solve(base({ lockedAllocs: locked, demand: [{ client_id: 'C1', month: '2026-11', hours: 8 }, { client_id: 'C2', month: '2026-11', hours: 8 }] }));
+      eq(r.allocations.some((a) => a.date === d2(2)), false);
+      eq(r.stats.totalAfter, 0);
+    });
+    test('提案A: チーム外は既定では使わず、有効にすると使ってチームに加える', () => {
+      const demand = [{ client_id: 'C1', month: '2026-11', hours: 8 }, { client_id: 'C9', month: '2026-11', hours: 168 }];
+      const full = fill('M1', 'C9', 8);
+      eq(solve(base({ allocs: full, demand })).unresolved.some((u) => u.client_id === 'C1'), true);
+      const out = solve(base({ allocs: full, allowOutsiders: true, demand }));
+      eq(out.unresolved.some((u) => u.client_id === 'C1'), false);
+      eq(out.teamsAdded, [{ client_id: 'C1', member_id: 'M2' }]);
+    });
+
+    // M1 は 11/2 に C2 へ8h(C2 の必要は0なので全部余剰)。他の日は C3 で埋まっている。C1 は8h不足。
+    const swapInput = (over = {}) => base({
+      allocs: [{ member_id: 'M1', client_id: 'C2', date: d2(2), hours: 8 }, ...fill('M1', 'C3', 8, [2])],
+      demand: [{ client_id: 'C1', month: '2026-11', hours: 8 }, { client_id: 'C2', month: '2026-11', hours: 0 }, { client_id: 'C3', month: '2026-11', hours: 160 }],
+      ...over,
+    });
+    test('提案B: 必要工数を超えたクライアントの余剰を、不足側へ付け替える(Aでは埋まらない)', () => {
+      eq(solve(swapInput()).stats.totalAfter, 8);
+      const b = solve(swapInput({ mode: 'B', weights: { w1: 3, w2: 1, w3: 1 } }));
+      eq(b.stats.totalAfter, 0);
+      eq(b.allocations.find((x) => x.date === d2(2) && x.client_id === 'C1').hours, 8);
+      eq(b.allocations.some((x) => x.date === d2(2) && x.client_id === 'C2'), false);
+    });
+    test('提案B: 「変更の少なさ」を最優先にすると、既存配員は動かさない', () => {
+      eq(solve(swapInput({ mode: 'B', weights: { w1: 1, w2: 3, w3: 1 } })).stats.totalAfter, 8);
+    });
+    test('提案: 「負荷の公平さ」を重視すると、稼働率の低いメンバーを選ぶ', () => {
+      const busy = [3, 4, 5, 6, 9, 10, 11, 12, 13].map((d) => ({ member_id: 'M1', client_id: 'C9', date: d2(d), hours: 6 }));
+      const r = solve(base({
+        teams: [{ client_id: 'C1', member_id: 'M1' }, { client_id: 'C1', member_id: 'M2' }], allocs: busy,
+        demand: [{ client_id: 'C1', month: '2026-11', hours: 8 }, { client_id: 'C9', month: '2026-11', hours: 54 }],
+        weights: { w1: 3, w2: 1, w3: 3 },
+      }));
+      eq(r.allocations.filter((a) => a.client_id === 'C1').every((a) => a.member_id === 'M2'), true);
+    });
+    test('提案: 結果から組み直したルールを展開すると、提案後の配員と一致する', () => {
+      const r = solve(base({ demand: [{ client_id: 'C1', month: '2026-11', hours: 100 }] }));
+      const norm = (xs) => xs.map((a) => `${a.member_id}|${a.client_id}|${a.date}|${a.hours}`).sort();
+      eq(norm(rebuildRules(r.allocations, 'x').allocations), norm(r.allocations));
+    });
+
+    // ---- 表示 ----
+    const out = document.getElementById('out');
+    for (const r of results) {
+      const p = document.createElement('div');
+      p.className = r.err ? 'ng' : 'ok';
+      p.textContent = `${r.err ? '✗' : '✓'} ${r.name}`;
+      out.append(p);
+      if (r.err) { const pre = document.createElement('pre'); pre.textContent = r.err; out.append(pre); }
+    }
+    const ng = results.filter((r) => r.err).length;
+    const sum = document.getElementById('summary');
+    sum.className = ng ? 'ng' : 'ok';
+    sum.textContent = ng ? `${ng} 件失敗 / ${results.length} 件中` : `すべて成功(${results.length} 件)`;
+  </script>
+</body>
+</html>

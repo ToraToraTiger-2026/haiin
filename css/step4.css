@@ -1,0 +1,19 @@
+/* ---- Step 4: 不足ビュー・需要入力・レポート・自動提案 ---- */
+table.shortage td.cell { text-align: left; min-width: 96px; vertical-align: top; line-height: 1.3; }
+table.shortage td.cell .sub { white-space: nowrap; }
+table.shortage td.total-col { min-width: 80px; font-weight: bold; }
+table.grid td.over .sub { color: var(--alert); opacity: 0.85; }
+td.demand-cell { min-width: 84px; }
+td.demand-cell input { width: 5em; text-align: right; }
+.result { margin-top: 16px; padding: 8px 14px; background: #fff; border: 1px solid var(--line); border-radius: 6px; }
+details { margin: 4px 0; }
+details summary { cursor: pointer; }
+.toolbar label { display: inline-flex; align-items: center; gap: 4px; }
+
+@media print {
+  .no-print, select, input[type="search"] { display: none !important; }
+  body { background: #fff; }
+  main { padding: 0; }
+  .scroll { border: none; max-height: none; overflow: visible; }
+  table.grid th.sticky, table.grid thead th { position: static; }
+}

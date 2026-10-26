@@ -1,0 +1,215 @@
+<!doctype html>
+<html lang="ja">
+<head>
+  <meta charset="utf-8">
+  <title>テスト</title>
+  <style>
+    body { font: 14px/1.6 "Yu Gothic UI", "Meiryo", sans-serif; margin: 20px; }
+    .ok { color: #1b7f3b; }
+    .ng { color: #c62828; font-weight: bold; }
+    #summary { font-size: 16px; font-weight: bold; margin-bottom: 8px; }
+    pre { margin: 0 0 0 1.5em; }
+  </style>
+</head>
+<body>
+  <h1>集計ロジックのテスト</h1>
+  <p>ブラウザで開くだけで実行されます(Live Server 経由で開いてください)。</p>
+  <div id="summary"></div>
+  <div id="out"></div>
+  <script type="module">
+    import { addDays, diffDays, eachDay, isValidDate, isWeekend, monthEnd, monthsBetween, weekStart } from './js/dates.js';
+    import { buildCapMap, capacityOf, freeOf, loadByMemberDay, monthlyAllocation, overByMemberDay, overOf, shortageByCell } from './js/calc.js';
+    import { checkOverload, expandRule, findOverlap } from './js/expand.js';
+    import { csvToRows, parseCsv, stringifyCsv } from './js/io.js';
+
+    const results = [];
+    const eq = (actual, expected) => {
+      const a = JSON.stringify(actual), e = JSON.stringify(expected);
+      if (a !== e) throw new Error(`期待 ${e} / 実際 ${a}`);
+    };
+    const test = (name, fn) => {
+      try { fn(); results.push({ name }); } catch (err) { results.push({ name, err: err.message }); }
+    };
+
+    // ---- dates ----
+    test('addDays: 月またぎ・年またぎ', () => {
+      eq(addDays('2026-01-31', 1), '2026-02-01');
+      eq(addDays('2026-12-31', 1), '2027-01-01');
+      eq(addDays('2026-03-01', -1), '2026-02-28');
+    });
+    test('addDays: うるう年', () => eq(addDays('2028-02-28', 1), '2028-02-29'));
+    test('diffDays', () => eq(diffDays('2026-04-01', '2026-04-10'), 9));
+    test('isWeekend: 2026-10-24(土)と10-26(月)', () => {
+      eq(isWeekend('2026-10-24'), true);
+      eq(isWeekend('2026-10-25'), true);
+      eq(isWeekend('2026-10-26'), false);
+    });
+    test('weekStart: 月曜始まり', () => {
+      eq(weekStart('2026-10-26'), '2026-10-26');
+      eq(weekStart('2026-10-25'), '2026-10-19');
+      eq(weekStart('2026-10-28'), '2026-10-26');
+    });
+    test('eachDay / monthEnd / monthsBetween', () => {
+      eq(eachDay('2026-02-27', '2026-03-02').length, 4);
+      eq(monthEnd('2026-02'), '2026-02-28');
+      eq(monthsBetween('2026-11-15', '2027-02-01'), ['2026-11', '2026-12', '2027-01', '2027-02']);
+    });
+    test('isValidDate', () => {
+      eq(isValidDate('2026-02-29'), false);
+      eq(isValidDate('2026-02-28'), true);
+      eq(isValidDate('2026-2-28'), false);
+    });
+
+    // ---- calc ----
+    const mem = { member_id: 'M1', name: 'A', std_cap: 8 };
+    const noCap = new Map();
+    test('Cap: 平日は標準上限、土日は0', () => {
+      eq(capacityOf(mem, '2026-10-26', noCap), 8);
+      eq(capacityOf(mem, '2026-10-24', noCap), 0);
+    });
+    test('Cap: capacity の例外が標準上限より優先(祝日0・時短4)', () => {
+      const cm = buildCapMap([{ member_id: 'M1', date: '2026-10-26', cap: 0 }, { member_id: 'M1', date: '2026-10-27', cap: 4 }]);
+      eq(capacityOf(mem, '2026-10-26', cm), 0);
+      eq(capacityOf(mem, '2026-10-27', cm), 4);
+      eq(capacityOf(mem, '2026-10-28', cm), 8);
+    });
+    test('負荷 L: クライアントをまたいで合計', () => {
+      const l = loadByMemberDay([
+        { member_id: 'M1', client_id: 'C1', date: '2026-10-26', hours: 3 },
+        { member_id: 'M1', client_id: 'C2', date: '2026-10-26', hours: 2.5 },
+        { member_id: 'M2', client_id: 'C1', date: '2026-10-26', hours: 4 },
+      ]);
+      eq(l.get('M1|2026-10-26'), 5.5);
+      eq(l.get('M2|2026-10-26'), 4);
+    });
+    test('Over / Free: 境界(L=Cap)では両方0', () => {
+      eq(overOf(8, 8), 0);
+      eq(freeOf(8, 8), 0);
+    });
+    test('Over / Free: 超過と余裕', () => {
+      eq(overOf(9.5, 8), 1.5);
+      eq(freeOf(9.5, 8), 0);
+      eq(overOf(5, 8), 0);
+      eq(freeOf(5, 8), 3);
+    });
+    test('Over: 浮動小数点の誤差を出さない', () => {
+      eq(overOf(0.1 + 0.2, 0.3), 0);
+    });
+    test('Cap 0 の日に配員があれば全量が超過', () => {
+      eq(overOf(2, 0), 2);
+    });
+
+    test('月の配員 A(c,t): 月ごと・クライアントごとに合計', () => {
+      const a = monthlyAllocation([
+        { client_id: 'C1', member_id: 'M1', date: '2026-10-30', hours: 3 },
+        { client_id: 'C1', member_id: 'M2', date: '2026-10-31', hours: 2 },
+        { client_id: 'C1', member_id: 'M1', date: '2026-11-02', hours: 4 },
+        { client_id: 'C2', member_id: 'M1', date: '2026-10-30', hours: 1 },
+      ]);
+      eq(a.get('C1|2026-10'), 5);
+      eq(a.get('C1|2026-11'), 4);
+      eq(a.get('C2|2026-10'), 1);
+    });
+    test('不足 Short: 需要 − 配員。配員が上回っても負にならない', () => {
+      const s = shortageByCell(
+        [{ client_id: 'C1', month: '2026-10', hours: 10 }, { client_id: 'C2', month: '2026-10', hours: 2 }],
+        [{ client_id: 'C1', member_id: 'M1', date: '2026-10-26', hours: 4 }, { client_id: 'C2', member_id: 'M1', date: '2026-10-26', hours: 5 }],
+      );
+      eq(s.get('C1|2026-10').short, 6);
+      eq(s.get('C2|2026-10').short, 0);
+    });
+    test('不足: 需要のない月に配員があっても不足は0(行は残る)', () => {
+      const s = shortageByCell([], [{ client_id: 'C9', member_id: 'M1', date: '2026-10-26', hours: 4 }]);
+      eq(s.get('C9|2026-10'), { client_id: 'C9', month: '2026-10', demand: 0, alloc: 4, short: 0 });
+    });
+    test('不足: 配員のない月は必要工数がそのまま不足', () => {
+      eq(shortageByCell([{ client_id: 'C1', month: '2026-12', hours: 7 }], []).get('C1|2026-12').short, 7);
+    });
+    test('上限超過のメンバー×日: 超過した日だけ返す', () => {
+      const o = overByMemberDay([
+        { member_id: 'M1', client_id: 'C1', date: '2026-10-26', hours: 6 },
+        { member_id: 'M1', client_id: 'C2', date: '2026-10-26', hours: 4 },
+        { member_id: 'M1', client_id: 'C1', date: '2026-10-27', hours: 8 },
+        { member_id: 'M1', client_id: 'C1', date: '2026-10-24', hours: 1 },
+      ], [mem], noCap);
+      eq([...o.entries()], [['M1|2026-10-26', 2], ['M1|2026-10-24', 1]]);
+    });
+
+    // ---- expand ----
+    const rule = { rule_id: 'R1', scenario_id: 'prod', member_id: 'M1', client_id: 'C1', start: '2026-10-23', end: '2026-10-28', hours_per_day: 4, include_weekend: false };
+    test('展開: 土日を除く(金・月・火・水の4日)', () => {
+      eq(expandRule(rule).map((a) => a.date), ['2026-10-23', '2026-10-26', '2026-10-27', '2026-10-28']);
+    });
+    test('展開: 土日を含める(6日)', () => {
+      eq(expandRule({ ...rule, include_weekend: true }).length, 6);
+    });
+    test('展開: 月またぎ', () => {
+      const a = expandRule({ ...rule, start: '2026-10-30', end: '2026-11-03' });
+      eq(a.map((x) => x.date), ['2026-10-30', '2026-11-02', '2026-11-03']);
+    });
+    test('展開: 1日だけ・時間が各行に入る', () => {
+      const a = expandRule({ ...rule, start: '2026-10-26', end: '2026-10-26' });
+      eq(a.length, 1);
+      eq(a[0].hours, 4);
+      eq(a[0].rule_id, 'R1');
+    });
+    test('重なり検出: 同メンバー同クライアントの期間重複のみ', () => {
+      const other = { ...rule, rule_id: 'R2', start: '2026-10-28', end: '2026-10-30' };
+      eq(findOverlap(rule, [other])?.rule_id, 'R2');
+      eq(findOverlap(rule, [{ ...other, start: '2026-10-29' }]), undefined);
+      eq(findOverlap(rule, [{ ...other, client_id: 'C2' }]), undefined);
+      eq(findOverlap(rule, [rule]), undefined); // 自分自身は除く
+    });
+    test('上限超過の警告: 他クライアントの配員と合算して判定', () => {
+      const existing = [{ member_id: 'M1', client_id: 'C2', date: '2026-10-26', hours: 6, rule_id: 'X' }];
+      const over = checkOverload(rule, existing, mem, noCap);
+      eq(over, [{ date: '2026-10-26', load: 10, cap: 8, over: 2 }]);
+    });
+    test('上限超過の警告: 編集中のルール自身の既存分は二重に数えない', () => {
+      const existing = expandRule(rule);
+      eq(checkOverload(rule, existing, mem, noCap), []);
+    });
+    test('上限超過の警告: 休日(Cap 0)に入れると超過', () => {
+      const cm = buildCapMap([{ member_id: 'M1', date: '2026-10-27', cap: 0 }]);
+      eq(checkOverload(rule, [], mem, cm).map((o) => o.date), ['2026-10-27']);
+    });
+
+    // ---- CSV ----
+    test('CSV: 引用符・カンマ・改行・BOM', () => {
+      const text = '﻿a,b\r\n"x,1","y ""q"""\r\n"l1\nl2",z\r\n';
+      eq(parseCsv(text), [['a', 'b'], ['x,1', 'y "q"'], ['l1\nl2', 'z']]);
+    });
+    test('CSV: 書き出して読み直すと同じ', () => {
+      const rows = [['a', 'b'], ['x,1', 'y "q"'], ['l1\nl2', '']];
+      eq(parseCsv(stringifyCsv(rows)), rows);
+    });
+    test('CSV取り込み: 日本語見出し・型変換', () => {
+      const r = csvToRows('capacity', 'メンバーID,日付,上限(時間)\nM1,2026-10-26,4\n');
+      eq(r.errors, []);
+      eq(r.rows, [{ member_id: 'M1', date: '2026-10-26', cap: 4 }]);
+    });
+    test('CSV取り込み: 不正な値と列不足をエラーにする', () => {
+      eq(csvToRows('capacity', 'メンバーID,日付,上限(時間)\nM1,2026-02-30,abc\n').errors.length, 2);
+      eq(csvToRows('capacity', 'メンバーID,日付\nM1,2026-10-26\n').errors.length, 1);
+    });
+    test('CSV取り込み: scenario_id が空なら本番', () => {
+      const r = csvToRows('team_members', 'クライアントID,メンバーID\nC1,M1\n');
+      eq(r.rows[0].scenario_id, 'prod');
+    });
+
+    // ---- 表示 ----
+    const out = document.getElementById('out');
+    for (const r of results) {
+      const p = document.createElement('div');
+      p.className = r.err ? 'ng' : 'ok';
+      p.textContent = `${r.err ? '✗' : '✓'} ${r.name}`;
+      out.append(p);
+      if (r.err) { const pre = document.createElement('pre'); pre.textContent = r.err; out.append(pre); }
+    }
+    const ng = results.filter((r) => r.err).length;
+    const sum = document.getElementById('summary');
+    sum.className = ng ? 'ng' : 'ok';
+    sum.textContent = ng ? `${ng} 件失敗 / ${results.length} 件中` : `すべて成功(${results.length} 件)`;
+  </script>
+</body>
+</html>
