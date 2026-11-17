@@ -1,3 +1,10 @@
 Thumbs.db
 .DS_Store
 *.log
+
+# 実データを含む書き出しファイル(バックアップJSON・CSV)はコミットしない
+haiin-backup-*.json
+haiin-*.csv
+不足_*.csv
+応援要請_*.csv
+解消できなかった不足_*.csv
